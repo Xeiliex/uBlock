@@ -1,7 +1,7 @@
 /*******************************************************************************
 
-    µBlock - a browser extension to block requests.
-    Copyright (C) 2014 Raymond Hill
+    uBlock Origin - a browser extension to block requests.
+    Copyright (C) 2014-present Raymond Hill
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -19,34 +19,27 @@
     Home: https://github.com/gorhill/uBlock
 */
 
-/* global vAPI, µBlock */
 'use strict';
 
 /******************************************************************************/
-
-// New namespace
 
 µBlock.contextMenu = (function() {
 
 /******************************************************************************/
 
-var µb = µBlock;
-var enabled = false;
+if ( vAPI.contextMenu === undefined ) {
+    return {
+        update: function() {}
+    };
+}
 
 /******************************************************************************/
 
-var onContextMenuClicked = function(details, tab) {
-    if ( details.menuItemId !== 'blockElement' ) {
-        return;
-    }
-    if ( tab === undefined ) {
-        return;
-    }
-    if ( /^https?:\/\//.test(tab.url) === false ) {
-        return;
-    }
-    var tagName = details.tagName || '';
-    var src = details.frameUrl || details.srcUrl || details.linkUrl || '';
+var onBlockElement = function(details, tab) {
+    if ( tab === undefined ) { return; }
+    if ( /^https?:\/\//.test(tab.url) === false ) { return; }
+    let tagName = details.tagName || '';
+    let src = details.frameUrl || details.srcUrl || details.linkUrl || '';
 
     if ( !tagName ) {
         if ( typeof details.frameUrl === 'string' ) {
@@ -64,34 +57,87 @@ var onContextMenuClicked = function(details, tab) {
         }
     }
 
-    µb.elementPickerExec(tab.id, tagName + '\t' + src);
+    µBlock.elementPickerExec(tab.id, tagName + '\t' + src);
 };
 
 /******************************************************************************/
 
-var toggleMenu = function(on) {
-    // This needs to be local scope: we can't reuse it for more than one
-    // menu creation call.
-    var menuCreateDetails = {
-        id: 'blockElement',
-        title: vAPI.i18n('pickerContextMenuEntry'),
-        contexts: ['page', 'editable', 'frame', 'link', 'image', 'video'],
-        documentUrlPatterns: ['https://*/*', 'http://*/*']
-    };
+var onTemporarilyAllowLargeMediaElements = function(details, tab) {
+    if ( tab === undefined ) { return; }
+    let pageStore = µBlock.pageStoreFromTabId(tab.id);
+    if ( pageStore === null ) { return; }
+    pageStore.temporarilyAllowLargeMediaElements(true);
+};
 
-    if ( on === true && enabled === false ) {
-        vAPI.contextMenu.create(menuCreateDetails, onContextMenuClicked);
-        enabled = true;
-    } else if ( on !== true && enabled === true ) {
-        vAPI.contextMenu.remove();
-        enabled = false;
+/******************************************************************************/
+
+var onEntryClicked = function(details, tab) {
+    if ( details.menuItemId === 'uBlock0-blockElement' ) {
+        return onBlockElement(details, tab);
+    }
+    if ( details.menuItemId === 'uBlock0-temporarilyAllowLargeMediaElements' ) {
+        return onTemporarilyAllowLargeMediaElements(details, tab);
     }
 };
 
 /******************************************************************************/
 
+var menuEntries = [
+    {
+        id: 'uBlock0-blockElement',
+        title: vAPI.i18n('pickerContextMenuEntry'),
+        contexts: ['all'],
+    },
+    {
+        id: 'uBlock0-temporarilyAllowLargeMediaElements',
+        title: vAPI.i18n('contextMenuTemporarilyAllowLargeMediaElements'),
+        contexts: ['all'],
+    }
+];
+
+/******************************************************************************/
+
+var update = function(tabId) {
+    let newBits = 0;
+    if ( µBlock.userSettings.contextMenuEnabled && tabId !== null ) {
+        let pageStore = µBlock.pageStoreFromTabId(tabId);
+        if ( pageStore && pageStore.getNetFilteringSwitch() ) {
+            newBits |= 0x01;
+            if ( pageStore.largeMediaCount !== 0 ) {
+                newBits |= 0x02;
+            }
+        }
+    }
+    if ( newBits === currentBits ) { return; }
+    currentBits = newBits;
+    let usedEntries = [];
+    if ( newBits & 0x01 ) {
+        usedEntries.push(menuEntries[0]);
+    }
+    if ( newBits & 0x02 ) {
+        usedEntries.push(menuEntries[1]);
+    }
+    vAPI.contextMenu.setEntries(usedEntries, onEntryClicked);
+};
+
+var currentBits = 0;
+
+vAPI.contextMenu.onMustUpdate = update;
+
+/******************************************************************************/
+
 return {
-    toggle: toggleMenu
+    update: function(tabId) {
+        if ( µBlock.userSettings.contextMenuEnabled && tabId === undefined ) {
+            vAPI.tabs.get(null, function(tab) {
+                if ( tab ) {
+                    update(tab.id);
+                }
+            });
+            return;
+        }
+        update(tabId);
+    }
 };
 
 /******************************************************************************/

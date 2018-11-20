@@ -1,7 +1,7 @@
 /*******************************************************************************
 
-    µBlock - a browser extension to block requests.
-    Copyright (C) 2014 Raymond Hill
+    uBlock Origin - a browser extension to block requests.
+    Copyright (C) 2014-present Raymond Hill
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -19,39 +19,39 @@
     Home: https://github.com/gorhill/uBlock
 */
 
-/* global vAPI, uDom */
+/* global CodeMirror, uBlockDashboard */
+
 'use strict';
 
 /******************************************************************************/
 
 (function() {
 
-/******************************************************************************/
+    let params = new URL(document.location).searchParams;
+    let assetKey = params.get('url');
+    if ( assetKey === null ) { return; }
 
-var messager = vAPI.messaging.channel('asset-viewer.js');
+    vAPI.messaging.send(
+        'default',
+        {
+            what : 'getAssetContent',
+            url: assetKey
+        },
+        details => {
+            cmEditor.setValue(details && details.content || '');
+        }
+    );
 
-/******************************************************************************/
+    let cmEditor = new CodeMirror(
+        document.getElementById('content'),
+        {
+            autofocus: true,
+            lineNumbers: true,
+            lineWrapping: true,
+            readOnly: true,
+            styleActiveLine: true
+        }
+    );
 
-var onAssetContentReceived = function(details) {
-    uDom('#content').text(details && (details.content || ''));
-};
-
-/******************************************************************************/
-
-var q = window.location.search;
-var matches = q.match(/^\?url=([^&]+)/);
-if ( !matches || matches.length !== 2 ) {
-    return;
-}
-
-messager.send(
-    {
-        what : 'getAssetContent',
-        url: decodeURIComponent(matches[1])
-    },
-    onAssetContentReceived
-);
-
-/******************************************************************************/
-
+    uBlockDashboard.patchCodeMirrorEditor(cmEditor);
 })();

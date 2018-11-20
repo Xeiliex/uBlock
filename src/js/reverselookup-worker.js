@@ -1,7 +1,7 @@
 /*******************************************************************************
 
-    uBlock - a browser extension to block requests.
-    Copyright (C) 2015 Raymond Hill
+    uBlock Origin - a browser extension to block requests.
+    Copyright (C) 2015-present Raymond Hill
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -25,48 +25,63 @@
 
 /******************************************************************************/
 
-var listEntries = Object.create(null);
+var listEntries = Object.create(null),
+    reBlockStart = /^#block-start-(\d+)\n/gm;
 
 /******************************************************************************/
 
-// Helpers
-
-var reEscape = function(s) {
-    return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+var extractBlocks = function(content, begId, endId) {
+    reBlockStart.lastIndex = 0;
+    var out = [];
+    var match = reBlockStart.exec(content);
+    while ( match !== null ) {
+        var beg = match.index + match[0].length;
+        var blockId = parseInt(match[1], 10);
+        if ( blockId >= begId && blockId < endId ) {
+            var end = content.indexOf('#block-end-' + match[1], beg);
+            out.push(content.slice(beg, end));
+            reBlockStart.lastIndex = end;
+        }
+        match = reBlockStart.exec(content);
+    }
+    return out.join('\n');
 };
-
-var reSpecialChars = /[\*\^\t\v\n]/;
 
 /******************************************************************************/
 
 var fromNetFilter = function(details) {
-    var lists = [];
+    var lists = [],
+        compiledFilter = details.compiledFilter;
 
-    var compiledFilter = details.compiledFilter;
-    var entry, content, pos, c;
-    for ( var path in listEntries ) {
-        entry = listEntries[path];
-        if ( entry === undefined ) {
-            continue;
+    for ( let assetKey in listEntries ) {
+        let entry = listEntries[assetKey];
+        if ( entry === undefined ) { continue; }
+        let content = extractBlocks(entry.content, 0, 1000);
+        let pos = 0;
+        for (;;) {
+            pos = content.indexOf(compiledFilter, pos);
+            if ( pos === -1 ) { break; }
+            // We need an exact match.
+            // https://github.com/gorhill/uBlock/issues/1392
+            // https://github.com/gorhill/uBlock/issues/835
+            let notFound = pos !== 0 && content.charCodeAt(pos - 1) !== 0x0A;
+            pos += compiledFilter.length;
+            if (
+                notFound ||
+                pos !== content.length && content.charCodeAt(pos) !== 0x0A
+            ) {
+                continue;
+            }
+            lists.push({
+                assetKey: assetKey,
+                title: entry.title,
+                supportURL: entry.supportURL
+            });
+            break;
         }
-        content = entry.content;
-        pos = content.indexOf(compiledFilter);
-        if ( pos === -1 ) {
-            continue;
-        }
-        // https://github.com/gorhill/uBlock/issues/835
-        // We need an exact match.
-        c = content.charAt(pos + compiledFilter.length);
-        if ( c !== '' && reSpecialChars.test(c) === false ) {
-            continue;
-        }
-        lists.push({
-            title: entry.title,
-            supportURL: entry.supportURL
-        });
     }
 
-    var response = {};
+    let response = {};
     response[details.rawFilter] = lists;
 
     postMessage({
@@ -97,94 +112,156 @@ var fromNetFilter = function(details) {
 // FilterContainer.fromCompiledContent() is our reference code to create
 // the various compiled versions.
 
-var fromCosmeticFilter = function(details) {
-    var filter = details.rawFilter;
-    var exception = filter.lastIndexOf('#@#', 0) === 0;
+let fromCosmeticFilter = function(details) {
+    let match = /^#@?#\^?/.exec(details.rawFilter),
+        prefix = match[0],
+        exception = prefix.charAt(1) === '@',
+        selector = details.rawFilter.slice(prefix.length);
 
-    filter = exception ? filter.slice(3) : filter.slice(2);
+    // The longer the needle, the lower the number of false positives.
+    let needle = selector.match(/\w+/g).reduce(function(a, b) {
+        return a.length > b.length ? a : b;
+    });
 
-    var candidates = Object.create(null);
-    var response = Object.create(null);
+    let reHostname = new RegExp(
+        '^' +
+        details.hostname.split('.').reduce(
+            function(acc, item) {
+                return acc === ''
+                     ? item
+                    : '(' + acc + '\\.)?' + item;
+            },
+            ''
+        ) +
+        '$'
+    );
 
-    // First step: assuming the filter is generic, find out its compiled
-    // representation.
-    // Reference: FilterContainer.compileGenericSelector().
-    var reStr = '';
-    var matches = rePlainSelector.exec(filter);
-    if ( matches ) {
-        if ( matches[0] === filter ) {          // simple CSS selector
-            reStr = reEscape('c\vlg\v' + filter);
-        } else {                                // complex CSS selector
-            reStr = reEscape('c\vlg+\v' + matches[0] + '\v' + filter);
-        }
-    } else if ( reHighLow.test(filter) ) {      // [alt] or [title]
-        reStr = reEscape('c\vhlg0\v' + filter);
-    } else if ( reHighMedium.test(filter) ) {   // [href^="..."]
-        reStr = reEscape('c\vhmg0\v') + '[a-z.-]+' + reEscape('\v') + '[a-z]*' + reEscape(filter);
-    } else {                                    // all else
-        reStr = reEscape('c\vhhg0\v' + filter);
-    }
-    candidates[details.rawFilter] = new RegExp(reStr + '(?:\\n|$)');
-
-    // Second step: find hostname-based versions.
-    // Reference: FilterContainer.compileHostnameSelector().
-    var pos;
-    var domain = details.domain;
-    var hostname = details.hostname;
-
-    if ( hostname !== '' ) {
-        for ( ;; ) {
-            candidates[hostname + '##' + filter] = new RegExp(
-                reEscape('c\vh\v') +
-                '\\w+' +
-                reEscape('\v' + hostname + '\v' + filter) +
-                '(?:\\n|$)'
-            );
-            // If there is no valid domain, there won't be any other
-            // version of this hostname-based filter.
-            if ( domain === '' ) {
-                break;
-            }
-            if ( hostname === domain ) {
-                break;
-            }
-            pos = hostname.indexOf('.');
-            if ( pos === -1 ) {
-                break;
-            }
-            hostname = hostname.slice(pos + 1);
-        }
-    }
-
-    // Last step: find entity-based versions.
-    // Reference: FilterContainer.compileEntitySelector().
-    pos = domain.indexOf('.');
+    let reEntity,
+        domain = details.domain,
+        pos = domain.indexOf('.');
     if ( pos !== -1 ) {
-        var entity = domain.slice(0, pos);
-        candidates[entity + '.*##' + filter] = new RegExp(
-            reEscape('c\ve\v' + entity + '\v' + filter) +
-            '(?:\\n|$)'
+        reEntity = new RegExp(
+            '^' +
+            domain.slice(0, pos).split('.').reduce(
+                function(acc, item) {
+                    return acc === ''
+                         ? item
+                        : '(' + acc + '\\.)?' + item;
+                },
+                ''
+            ) +
+            '\\.\\*$'
         );
     }
+        
+    let hostnameMatches = hn => {
+        return hn === '' ||
+               reHostname.test(hn) ||
+               reEntity !== undefined && reEntity.test(hn);
+    };
 
-    var re, path, entry;
-    for ( var candidate in candidates ) {
-        re = candidates[candidate];
-        for ( path in listEntries ) {
-            entry = listEntries[path];
-            if ( entry === undefined ) {
+    let response = Object.create(null);
+
+    for ( let assetKey in listEntries ) {
+        let entry = listEntries[assetKey];
+        if ( entry === undefined ) { continue; }
+        let content = extractBlocks(entry.content, 1000, 2000),
+            isProcedural,
+            found;
+        let pos = 0;
+        while ( (pos = content.indexOf(needle, pos)) !== -1 ) {
+            let beg = content.lastIndexOf('\n', pos);
+            if ( beg === -1 ) { beg = 0; }
+            let end = content.indexOf('\n', pos);
+            if ( end === -1 ) { end = content.length; }
+            pos = end;
+            let fargs = JSON.parse(content.slice(beg, end));
+
+            // https://github.com/gorhill/uBlock/issues/2763
+            if ( fargs[0] >= 0 && fargs[0] <= 5 && details.ignoreGeneric ) {
                 continue;
             }
-            if ( re.test(entry.content) === false ) {
-                continue;
+
+            switch ( fargs[0] ) {
+            // Lowly generic cosmetic filters
+            case 0: // simple id-based
+                if (
+                    fargs[1] === selector.slice(1) &&
+                    selector.charAt(0) === '#'
+                ) {
+                    found = prefix + selector;
+                }
+                break;
+            case 2: // simple class-based
+                if (
+                    fargs[1] === selector.slice(1) &&
+                    selector.charAt(0) === '.'
+                ) {
+                    found = prefix + selector;
+                }
+                break;
+            case 1: // complex id-based
+            case 3: // complex class-based
+                if ( fargs[2] === selector ) {
+                    found = prefix + selector;
+                }
+                break;
+            // Highly generic cosmetic filters
+            case 4: // simple highly generic
+            case 5: // complex highly generic
+            case 7: // generic exception
+                if ( fargs[1] === selector ) {
+                    found = prefix + selector;
+                }
+                break;
+            // Specific cosmetic filtering
+            case 8:
+                if ( exception !== ((fargs[1] & 0b0001) !== 0) ) { break; }
+                isProcedural = (fargs[1] & 0b0010) !== 0;
+                if (
+                    isProcedural === false && fargs[3] !== selector ||
+                    isProcedural && JSON.parse(fargs[3]).raw !== selector
+                ) {
+                    break;
+                }
+                if ( hostnameMatches(fargs[2]) ) {
+                    found = fargs[2] + prefix + selector;
+                }
+                break;
+            // Scriptlet injection
+            case 32:
+                if ( exception !== ((fargs[1] & 0b0001) !== 0) ) { break; }
+                if ( fargs[3] !== selector ) { break; }
+                if ( hostnameMatches(fargs[2]) ) {
+                    found = fargs[2] + prefix + selector;
+                }
+                break;
+            // HTML filtering
+            case 64: // CSS selector
+            case 65: // procedural
+                if ( exception !== ((fargs[1] & 0b0001) !== 0) ) { break; }
+                if (
+                    fargs[0] === 64 && fargs[3] !== selector ||
+                    fargs[0] === 65 && JSON.parse(fargs[3]).raw !== selector
+                ) {
+                    break;
+                }
+                if ( hostnameMatches(fargs[2]) ) {
+                    found = fargs[2] + prefix + selector;
+                }
+                break;
             }
-            if ( response[candidate] === undefined ) {
-                response[candidate] = [];
+            if ( found !== undefined  ) {
+                if ( response[found] === undefined ) {
+                    response[found] = [];
+                }
+                response[found].push({
+                    assetKey: assetKey,
+                    title: entry.title,
+                    supportURL: entry.supportURL
+                });
+                break;
             }
-            response[candidate].push({
-                title: entry.title,
-                supportURL: entry.supportURL
-            });
         }
     }
 
@@ -194,13 +271,9 @@ var fromCosmeticFilter = function(details) {
     });
 };
 
-var rePlainSelector = /^([#.][\w-]+)/;
-var reHighLow = /^[a-z]*\[(?:alt|title)="[^"]+"\]$/;
-var reHighMedium = /^\[href\^="https?:\/\/([^"]{8})[^"]*"\]$/;
-
 /******************************************************************************/
 
-onmessage = function(e) {
+onmessage = function(e) { // jshint ignore:line
     var msg = e.data;
 
     switch ( msg.what ) {
@@ -209,7 +282,7 @@ onmessage = function(e) {
         break;
 
     case 'setList':
-        listEntries[msg.details.path] = msg.details;
+        listEntries[msg.details.assetKey] = msg.details;
         break;
 
     case 'fromNetFilter':

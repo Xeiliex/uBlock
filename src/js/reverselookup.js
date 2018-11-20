@@ -1,7 +1,7 @@
 /*******************************************************************************
 
-    uBlock - a browser extension to block requests.
-    Copyright (C) 2015 Raymond Hill
+    uBlock Origin - a browser extension to block requests.
+    Copyright (C) 2015-present Raymond Hill
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -19,18 +19,16 @@
     Home: https://github.com/gorhill/uBlock
 */
 
-/* global µBlock */
+'use strict';
 
 /******************************************************************************/
 
 µBlock.staticFilteringReverseLookup = (function() {
 
-'use strict';
-
 /******************************************************************************/
 
 var worker = null;
-var workerTTL = 11 * 60 * 1000;
+var workerTTL = 5 * 60 * 1000;
 var workerTTLTimer = null;
 var needLists = true;
 var messageId = 1;
@@ -77,16 +75,16 @@ var initWorker = function(callback) {
     var countdown = 0;
 
     var onListLoaded = function(details) {
-        var entry = entries[details.path];
+        var entry = entries[details.assetKey];
 
         // https://github.com/gorhill/uBlock/issues/536
-        // Use path string when there is no filter list title.
+        // Use assetKey when there is no filter list title.
 
         worker.postMessage({
             what: 'setList',
             details: {
-                path: details.path,
-                title: entry.title || details.path,
+                assetKey: details.assetKey,
+                title: entry.title || details.assetKey,
                 supportURL: entry.supportURL,
                 content: details.content
             }
@@ -99,18 +97,18 @@ var initWorker = function(callback) {
     };
 
     var µb = µBlock;
-    var path, entry;
+    var listKey, entry;
 
-    for ( path in µb.remoteBlacklists ) {
-        if ( µb.remoteBlacklists.hasOwnProperty(path) === false ) {
+    for ( listKey in µb.availableFilterLists ) {
+        if ( µb.availableFilterLists.hasOwnProperty(listKey) === false ) {
             continue;
         }
-        entry = µb.remoteBlacklists[path];
-        if ( entry.off === true ) {
-            continue;
-        }
-        entries[path] = {
-            title: path !== µb.userFiltersPath ? entry.title : vAPI.i18n('1pPageName'),
+        entry = µb.availableFilterLists[listKey];
+        if ( entry.off === true ) { continue; }
+        entries[listKey] = {
+            title: listKey !== µb.userFiltersPath ?
+                entry.title :
+                vAPI.i18n('1pPageName'),
             supportURL: entry.supportURL || ''
         };
         countdown += 1;
@@ -121,8 +119,8 @@ var initWorker = function(callback) {
         return;
     }
 
-    for ( path in entries ) {
-        µb.getCompiledFilterList(path, onListLoaded);
+    for ( listKey in entries ) {
+        µb.getCompiledFilterList(listKey, onListLoaded);
     }
 };
 
@@ -163,12 +161,10 @@ var fromNetFilter = function(compiledFilter, rawFilter, callback) {
 
 /******************************************************************************/
 
-var fromCosmeticFilter = function(hostname, rawFilter, callback) {
-    if ( typeof callback !== 'function' ) {
-        return;
-    }
+var fromCosmeticFilter = function(details, callback) {
+    if ( typeof callback !== 'function' ) { return; }
 
-    if ( rawFilter === '' ) {
+    if ( details.rawFilter === '' ) {
         callback();
         return;
     }
@@ -178,17 +174,19 @@ var fromCosmeticFilter = function(hostname, rawFilter, callback) {
         workerTTLTimer = null;
     }
 
-    var onWorkerReady = function() {
-        var id = messageId++;
-        var message = {
+    let onWorkerReady = function() {
+        let id = messageId++;
+        let hostname = µBlock.URI.hostnameFromURI(details.url);
+        pendingResponses[id] = callback;
+        worker.postMessage({
             what: 'fromCosmeticFilter',
             id: id,
             domain: µBlock.URI.domainFromHostname(hostname),
             hostname: hostname,
-            rawFilter: rawFilter
-        };
-        pendingResponses[id] = callback;
-        worker.postMessage(message);
+            ignoreGeneric: µBlock.staticNetFilteringEngine
+                                 .matchStringGenericHide(details.url) === 2,
+            rawFilter: details.rawFilter
+        });
 
         // The worker will be shutdown after n minutes without being used.
         workerTTLTimer = vAPI.setTimeout(stopWorker, workerTTL);
