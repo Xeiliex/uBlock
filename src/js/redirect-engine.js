@@ -1,7 +1,7 @@
 /*******************************************************************************
 
-    uBlock Origin - a browser extension to block requests.
-    Copyright (C) 2015 Raymond Hill
+    uBlock Origin - a comprehensive, efficient content blocker
+    Copyright (C) 2015-present Raymond Hill
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU General Public License as published by
@@ -19,250 +19,443 @@
     Home: https://github.com/gorhill/uBlock
 */
 
-/* global µBlock */
+import { LineIterator, orphanizeString } from './text-utils.js';
+import redirectableResources from './redirect-resources.js';
 
 /******************************************************************************/
 
-µBlock.redirectEngine = (function(){
+const extToMimeMap = new Map([
+    [  'css', 'text/css' ],
+    [   'fn', 'fn/javascript' ], // invented mime type for internal use
+    [  'gif', 'image/gif' ],
+    [ 'html', 'text/html' ],
+    [   'js', 'text/javascript' ],
+    [ 'json', 'application/json' ],
+    [  'mp3', 'audio/mp3' ],
+    [  'mp4', 'video/mp4' ],
+    [  'png', 'image/png' ],
+    [  'txt', 'text/plain' ],
+    [  'xml', 'text/xml' ],
+]);
 
-'use strict';
+const typeToMimeMap = new Map([
+    [     'main_frame', 'text/html' ],
+    [          'other', 'text/plain' ],
+    [         'script', 'text/javascript' ],
+    [     'stylesheet', 'text/css' ],
+    [      'sub_frame', 'text/html' ],
+    [ 'xmlhttprequest', 'text/plain' ],
+]);
+
+const validMimes = new Set(extToMimeMap.values());
+
+const mimeFromName = name => {
+    const match = /\.([^.]+)$/.exec(name);
+    if ( match === null ) { return ''; }
+    return extToMimeMap.get(match[1]);
+};
+
+const removeTopCommentBlock = text => {
+    return text.replace(/^\/\*[\S\s]+?\*\/\s*/g, '');
+};
+
+// vAPI.warSecret is optional, it could be absent in some environments,
+// i.e. nodejs for example. Probably the best approach is to have the
+// "web_accessible_resources secret" added outside by the client of this
+// module, but for now I just want to remove an obstacle to modularization.
+const warSecret = typeof vAPI === 'object' && vAPI !== null
+    ? vAPI.warSecret.short
+    : ( ) => '';
+
+const RESOURCES_SELFIE_VERSION = 7;
+const RESOURCES_SELFIE_NAME = 'selfie/redirectEngine/resources';
 
 /******************************************************************************/
+/******************************************************************************/
 
-var toBroaderHostname = function(hostname) {
-    var pos = hostname.indexOf('.');
-    if ( pos !== -1 ) {
-        return hostname.slice(pos + 1);
+class RedirectEntry {
+    constructor() {
+        this.mime = '';
+        this.data = '';
+        this.warURL = undefined;
+        this.params = undefined;
+        this.requiresTrust = false;
+        this.world = 'MAIN';
+        this.dependencies = [];
     }
-    return hostname !== '*' && hostname !== '' ? '*' : '';
-};
 
-/******************************************************************************/
+    // Prevent redirection to web accessible resources when the request is
+    // of type 'xmlhttprequest', because XMLHttpRequest.responseURL would
+    // cause leakage of extension id. See:
+    // - https://stackoverflow.com/a/8056313
+    // - https://bugzilla.mozilla.org/show_bug.cgi?id=998076
+    // https://www.reddit.com/r/uBlockOrigin/comments/cpxm1v/
+    //   User-supplied resources may already be base64 encoded.
 
-var RedirectEngine = function() {
-    this.redirects = Object.create(null);
-    this.reset();
-};
-
-/******************************************************************************/
-
-RedirectEngine.prototype.reset = function() {
-    this.rules = Object.create(null);
-};
-
-/******************************************************************************/
-
-RedirectEngine.prototype.freeze = function() {
-};
-
-/******************************************************************************/
-
-RedirectEngine.prototype.lookup = function(context) {
-    var typeEntry = this.rules[context.requestType];
-    if ( typeEntry === undefined ) {
-        return;
+    toURL(fctxt, asDataURI = false) {
+        if (
+            this.warURL !== undefined &&
+            asDataURI !== true &&
+            fctxt instanceof Object &&
+            fctxt.type !== 'xmlhttprequest'
+        ) {
+            const params = [];
+            const secret = warSecret();
+            if ( secret !== '' ) { params.push(`secret=${secret}`); }
+            if ( this.params !== undefined ) {
+                for ( const name of this.params ) {
+                    const value = fctxt[name];
+                    if ( value === undefined ) { continue; }
+                    params.push(`${name}=${encodeURIComponent(value)}`);
+                }
+            }
+            let url = `${this.warURL}`;
+            if ( params.length !== 0 ) {
+                url += `?${params.join('&')}`;
+            }
+            return url;
+        }
+        if ( this.data === undefined ) { return; }
+        // https://github.com/uBlockOrigin/uBlock-issues/issues/701
+        if ( this.data === '' ) {
+            const mime = typeToMimeMap.get(fctxt.type);
+            if ( mime === '' ) { return; }
+            return `data:${mime},`;
+        }
+        if ( this.data.startsWith('data:') === false ) {
+            if ( this.mime.indexOf(';') === -1 ) {
+                this.data = `data:${this.mime};base64,${btoa(this.data)}`;
+            } else {
+                this.data = `data:${this.mime},${this.data}`;
+            }
+        }
+        return this.data;
     }
-    var src, des = context.requestHostname,
-        srcHostname = context.pageHostname,
-        reqURL = context.requestURL,
-        desEntry, entries, i, entry;
-    for (;;) {
-        desEntry = typeEntry[des];
-        if ( desEntry !== undefined ) {
-            src = srcHostname;
-            for (;;) {
-                entries = desEntry[src];
-                if ( entries !== undefined ) {
-                    i = entries.length;
-                    while ( i-- ) {
-                        entry = entries[i];
-                        if ( entry.c.test(reqURL) ) {
-                            return this.redirects[entry.r];
-                        }
+
+    toContent() {
+        if ( this.data.startsWith('data:') ) {
+            const pos = this.data.indexOf(',');
+            const base64 = this.data.endsWith(';base64', pos);
+            this.data = this.data.slice(pos + 1);
+            if ( base64 ) {
+                this.data = atob(this.data);
+            }
+        }
+        return this.data;
+    }
+
+    static fromDetails(details) {
+        const r = new RedirectEntry();
+        Object.assign(r, details);
+        return r;
+    }
+}
+
+/******************************************************************************/
+/******************************************************************************/
+
+class RedirectEngine {
+    constructor() {
+        this.aliases = new Map();
+        this.resources = new Map();
+        this.reset();
+        this.modifyTime = Date.now();
+    }
+
+    reset() {
+    }
+
+    freeze() {
+    }
+
+    tokenToURL(
+        fctxt,
+        token,
+        asDataURI = false
+    ) {
+        const entry = this.resources.get(this.aliases.get(token) || token);
+        if ( entry === undefined ) { return; }
+        return entry.toURL(fctxt, asDataURI);
+    }
+
+    tokenToDNR(token) {
+        const entry = this.resources.get(this.aliases.get(token) || token);
+        if ( entry === undefined ) { return; }
+        if ( entry.warURL === undefined ) { return; }
+        return entry.warURL;
+    }
+
+    hasToken(token) {
+        if ( token === 'none' ) { return true; }
+        const asDataURI = token.charCodeAt(0) === 0x25 /* '%' */;
+        if ( asDataURI ) {
+            token = token.slice(1);
+        }
+        return this.resources.get(this.aliases.get(token) || token) !== undefined;
+    }
+
+    tokenRequiresTrust(token) {
+        const entry = this.resources.get(this.aliases.get(token) || token);
+        return entry && entry.requiresTrust === true || false;
+    }
+
+    async toSelfie() {
+    }
+
+    async fromSelfie() {
+        return true;
+    }
+
+    contentFromName(name, mime = '') {
+        const entry = this.resources.get(this.aliases.get(name) || name);
+        if ( entry === undefined ) { return; }
+        if ( entry.mime.startsWith(mime) === false ) { return; }
+        if ( entry.data === undefined ) { return; }
+        return {
+            js: entry.toContent(),
+            world: entry.world,
+            dependencies: entry.dependencies.slice(),
+            priority: entry.priority ?? 0,
+        };
+    }
+
+    // https://github.com/uBlockOrigin/uAssets/commit/deefe8755511
+    //   Consider 'none' a reserved keyword, to be used to disable redirection.
+    // https://github.com/uBlockOrigin/uBlock-issues/issues/1419
+    //   Append newlines to raw text to ensure processing of trailing resource.
+
+    resourcesFromString(text) {
+        const lineIter = new LineIterator(
+            removeTopCommentBlock(text) + '\n\n'
+        );
+        const reNonEmptyLine = /\S/;
+        let fields, encoded, details;
+
+        while ( lineIter.eot() === false ) {
+            const line = lineIter.next();
+            if ( line.startsWith('#') ) { continue; }
+            if ( line.startsWith('// ') ) { continue; }
+
+            if ( fields === undefined ) {
+                if ( line === '' ) { continue; }
+                // Modern parser
+                if ( line.startsWith('/// ') ) {
+                    const name = line.slice(4).trim();
+                    fields = [ name, mimeFromName(name) ];
+                    continue;
+                }
+                // Legacy parser
+                const head = line.trim().split(/\s+/);
+                if ( head.length !== 2 ) { continue; }
+                if ( head[0] === 'none' ) { continue; }
+                let pos = head[1].indexOf(';');
+                if ( pos === -1 ) { pos = head[1].length; }
+                if ( validMimes.has(head[1].slice(0, pos)) === false ) {
+                    continue;
+                }
+                encoded = head[1].indexOf(';') !== -1;
+                fields = head;
+                continue;
+            }
+
+            if ( line.startsWith('/// ') ) {
+                if ( details === undefined ) {
+                    details = [];
+                }
+                const [ prop, value ] = line.slice(4).trim().split(/\s+/);
+                if ( value !== undefined ) {
+                    details.push({ prop, value });
+                }
+                continue;
+            }
+
+            if ( reNonEmptyLine.test(line) ) {
+                fields.push(encoded ? line.trim() : line);
+                continue;
+            }
+
+            // No more data, add the resource.
+            const name = this.aliases.get(fields[0]) || fields[0];
+            const mime = fields[1];
+            const data = orphanizeString(
+                fields.slice(2).join(encoded ? '' : '\n')
+            );
+            this.resources.set(name, RedirectEntry.fromDetails({ mime, data, origin: 'user' }));
+            if ( Array.isArray(details) ) {
+                const resource = this.resources.get(name);
+                for ( const { prop, value } of details ) {
+                    switch ( prop ) {
+                    case 'alias':
+                        this.aliases.set(value, name);
+                        break;
+                    case 'world':
+                        if ( /^isolated$/i.test(value) === false ) { break; }
+                        resource.world = 'ISOLATED';
+                        break;
+                    case 'dependency':
+                        if ( this.resources.has(value) === false ) { break; }
+                        resource.dependencies.push(value);
+                        break;
+                    default:
+                        break;
                     }
                 }
-                src = toBroaderHostname(src);
-                if ( src === '' ) {
-                    break;
+            }
+
+            fields = undefined;
+            details = undefined;
+        }
+
+        this.modifyTime = Date.now();
+    }
+
+    loadBuiltinResources(fetcher) {
+        this.resources = new Map();
+        this.aliases = new Map();
+
+        const fetches = [
+            import('/js/resources/scriptlets.js').then(module => {
+                for ( const scriptlet of module.builtinScriptlets ) {
+                    const details = {};
+                    details.mime = mimeFromName(scriptlet.name);
+                    details.data = scriptlet.fn.toString();
+                    for ( const [ k, v ] of Object.entries(scriptlet) ) {
+                        if ( k === 'fn' ) { continue; }
+                        details[k] = v;
+                    }
+                    const entry = RedirectEntry.fromDetails(details);
+                    this.resources.set(details.name, entry);
+                    if ( Array.isArray(details.aliases) === false ) { continue; }
+                    for ( const alias of details.aliases ) {
+                        this.aliases.set(alias, details.name);
+                    }
                 }
+                this.modifyTime = Date.now();
+            }).catch(reason => {
+                console.error(reason);
+            }),
+        ];
+
+        const storeWAR = (name, data = undefined) => {
+            const details = redirectableResources.get(name);
+            const entry = RedirectEntry.fromDetails({
+                mime: mimeFromName(name),
+                data,
+                warURL: `/web_accessible_resources/${name}`,
+                params: details.params,
+                origin: 'war',
+            });
+            this.resources.set(name, entry);
+            if ( details.alias === undefined ) { return; }
+            if ( Array.isArray(details.alias) ) {
+                for ( const alias of details.alias ) {
+                    this.aliases.set(alias, name);
+                }
+            } else {
+                this.aliases.set(details.alias, name);
             }
-        }
-        des = toBroaderHostname(des);
-        if ( des === '' ) {
-            break;
-        }
-    }
-};
+        };
 
-/******************************************************************************/
+        const processBlob = (name, blob) => {
+            return new Promise(resolve => {
+                const reader = new FileReader();
+                reader.onload = ( ) => {
+                    storeWAR(name, reader.result);
+                    resolve();
+                };
+                reader.onabort = reader.onerror = ( ) => {
+                    resolve();
+                };
+                reader.readAsDataURL(blob);
+            });
+        };
 
-// TODO: combine same key-redirect pairs into a single regex.
+        const processText = (name, text) => {
+            storeWAR(name, removeTopCommentBlock(text));
+        };
 
-RedirectEngine.prototype.addRule = function(src, des, type, pattern, redirect) {
-    var typeEntry = this.rules[type];
-    if ( typeEntry === undefined ) {
-        typeEntry = this.rules[type] = Object.create(null);
-    }
-    var desEntry = typeEntry[des];
-    if ( desEntry === undefined ) {
-        desEntry = typeEntry[des] = Object.create(null);
-    }
-    var ruleEntries = desEntry[src];
-    if ( ruleEntries === undefined ) {
-        ruleEntries = desEntry[src] = [];
-    }
-    ruleEntries.push({
-        c: new RegExp(pattern),
-        r: redirect
-    });
-};
+        const processWAR = result => {
+            const match = /^\/web_accessible_resources\/([^?]+)/.exec(result.url);
+            if ( match === null ) { return; }
+            const name = match[1];
+            return result.content instanceof Blob
+                ? processBlob(name, result.content)
+                : processText(name, result.content);
+        };
 
-/******************************************************************************/
-
-RedirectEngine.prototype.fromCompiledRule = function(line) {
-    var fields = line.split('\t');
-    if ( fields.length !== 5 ) {
-        return;
-    }
-    this.addRule(fields[0], fields[1], fields[2], fields[3], fields[4]);
-};
-
-/******************************************************************************/
-
-RedirectEngine.prototype.compileRuleFromStaticFilter = function(line) {
-    var matches = this.reFilterParser.exec(line);
-    if ( matches === null || matches.length !== 4 ) {
-        return '';
-    }
-
-    var pattern = (matches[1] + matches[2]).replace(/[.+?{}()|[\]\\]/g, '\\$&')
-                                           .replace(/\^/g, '[^\\w\\d%-]')
-                                           .replace(/\*/g, '.*?');
-
-    var des = matches[1];
-    var types = [];
-    var redirect = '';
-    var srcs = [];
-    var options = matches[3].split(','), option;
-    while ( (option = options.pop()) ) {
-        if ( option.lastIndexOf('redirect=', 0) === 0 ) {
-            redirect = option.slice(9);
-            continue;
-        }
-        if ( option.lastIndexOf('domain=', 0) === 0 ) {
-            srcs = option.slice(7).split('|');
-            continue;
-        }
-        if ( option in this.supportedTypes ) {
-            types.push(option);
-            continue;
-        }
-    }
-
-    if ( redirect === '' || types.length === 0 ) {
-        return '';
-    }
-
-    if ( des === '' ) {
-        des = '*';
-    }
-
-    if ( srcs.length === 0 ) {
-        srcs.push('*');
-    }
-
-    var out = [];
-    var i = srcs.length, j;
-    while ( i-- ) {
-        j = types.length;
-        while ( j-- ) {
-            out.push(srcs[i] + '\t' + des + '\t' + types[j] + '\t' + pattern + '\t' + redirect);
-        }
-    }
-
-    return out;
-};
-
-/******************************************************************************/
-
-RedirectEngine.prototype.reFilterParser = /^\|\|([^\/\?#]+)([^$]+)\$([^$]+)$/;
-
-RedirectEngine.prototype.supportedTypes = (function() {
-    var types = Object.create(null);
-    types.stylesheet = 'stylesheet';
-    types.image = 'image';
-    types.object = 'object';
-    types.script = 'script';
-    types.xmlhttprequest = 'xmlhttprequest';
-    types.subdocument = 'sub_frame';
-    types.font = 'font';
-    return types;
-})();
-
-/******************************************************************************/
-
-// TODO: combine same key-redirect pairs into a single regex.
-
-RedirectEngine.prototype.redirectDataFromString = function(text) {
-    var textEnd = text.length;
-    var lineBeg = 0, lineEnd;
-    var mode, modeData, line, fields, encoded, data;
-
-    this.redirects = Object.create(null);
-
-    while ( lineBeg < textEnd ) {
-        lineEnd = text.indexOf('\n', lineBeg);
-        if ( lineEnd < 0 ) {
-            lineEnd = text.indexOf('\r', lineBeg);
-            if ( lineEnd < 0 ) {
-                lineEnd = textEnd;
-            }
-        }
-        line = text.slice(lineBeg, lineEnd).trim();
-        lineBeg = lineEnd + 1;
-
-        if ( line.charAt(0) === '#' ) {
-            continue;
-        }
-
-        if ( line.slice(-1) === ':' ) {
-            mode = line.slice(0, -1);
-            continue;
-        }
-
-        if ( mode === 'redirects' ) {
-            fields = line.split(/\s+/);
-            if ( fields.length !== 2 ) {
+        for ( const [ name, details ] of redirectableResources ) {
+            if ( typeof details.data !== 'string' ) {
+                storeWAR(name);
                 continue;
             }
-            mode = 'redirects/redirect';
-            modeData = fields;
-            continue;
+            fetches.push(
+                fetcher(`/web_accessible_resources/${name}`, {
+                    responseType: details.data
+                }).then(
+                    result => processWAR(result)
+                )
+            );
         }
 
-        if ( mode === 'redirects/redirect' ) {
-            if ( line !== '' ) {
-                modeData.push(line);
-                continue;
-            }
-            encoded = modeData[1].indexOf(';') !== -1;
-            data = modeData.slice(2).join(encoded ? '' : '\n');
-            this.redirects[modeData[0]] =
-                'data:' +
-                modeData[1] + 
-                (encoded ? '' : ';base64') +
-                ',' +
-                (encoded ? data : btoa(data));
-            mode = 'redirects';
-            continue;
-        }
+        return Promise.all(fetches);
     }
-};
+
+    getResourceDetails() {
+        const out = new Map([
+            [ 'none', { canInject: false, canRedirect: true, aliasOf: '' } ],
+        ]);
+        for ( const [ name, entry ] of this.resources ) {
+            out.set(name, {
+                canInject: typeof entry.data === 'string',
+                canRedirect: Boolean(entry.warURL ?? entry.data),
+                aliasOf: '',
+                extensionPath: entry.warURL,
+            });
+        }
+        for ( const [ alias, name ] of this.aliases ) {
+            const original = out.get(name);
+            if ( original === undefined ) { continue; }
+            const aliased = Object.assign({}, original);
+            aliased.aliasOf = name;
+            out.set(alias, aliased);
+        }
+        return Array.from(out).sort((a, b) => {
+            return a[0].localeCompare(b[0]);
+        });
+    }
+
+    selfieFromResources(storage) {
+        return storage.toCache(RESOURCES_SELFIE_NAME, {
+            version: RESOURCES_SELFIE_VERSION,
+            aliases: this.aliases,
+            resources: this.resources,
+        });
+    }
+
+    async resourcesFromSelfie(storage) {
+        const selfie = await storage.fromCache(RESOURCES_SELFIE_NAME);
+        if ( selfie instanceof Object === false ) { return false; }
+        if ( selfie.version !== RESOURCES_SELFIE_VERSION ) { return false; }
+        if ( selfie.aliases instanceof Map === false ) { return false; }
+        if ( selfie.resources instanceof Map === false ) { return false; }
+        this.aliases = selfie.aliases;
+        this.resources = selfie.resources;
+        for ( const [ token, entry ] of this.resources ) {
+            this.resources.set(token, RedirectEntry.fromDetails(entry));
+        }
+        this.modifyTime = Date.now();
+        return true;
+    }
+
+    invalidateResourcesSelfie(storage) {
+        storage.remove(RESOURCES_SELFIE_NAME);
+    }
+}
 
 /******************************************************************************/
 
-return new RedirectEngine();
+const redirectEngine = new RedirectEngine();
+
+export { redirectEngine };
 
 /******************************************************************************/
-
-})();
